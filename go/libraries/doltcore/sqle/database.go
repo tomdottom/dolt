@@ -29,20 +29,42 @@ import (
 
 var _ sql.Database = (*Database)(nil)
 
+type batchMode bool
+
+const (
+	batched batchMode = true
+	single  batchMode = false
+)
+
 // Database implements sql.Database for a dolt DB.
 type Database struct {
-	sql.Database
-	name string
-	root *doltdb.RootValue
-	dEnv *env.DoltEnv
+	name      string
+	root      *doltdb.RootValue
+	dEnv      *env.DoltEnv
+	batchMode batchMode
+	tables    map[string]*DoltTable
 }
 
-// NewDatabase returns a new dolt databae to use in queries.
+// NewDatabase returns a new dolt database to use in queries.
 func NewDatabase(name string, root *doltdb.RootValue, dEnv *env.DoltEnv) *Database {
 	return &Database{
-		name: name,
-		root: root,
-		dEnv: dEnv,
+		name:      name,
+		root:      root,
+		dEnv:      dEnv,
+		batchMode: single,
+		tables:    make(map[string]*DoltTable),
+	}
+}
+
+// NewBatchedDatabase returns a new dolt database executing in batch insert mode. Integrators must call Flush() to
+// commit any outstanding edits.
+func NewBatchedDatabase(name string, root *doltdb.RootValue, dEnv *env.DoltEnv) *Database {
+	return &Database{
+		name:      name,
+		root:      root,
+		dEnv:      dEnv,
+		batchMode: batched,
+		tables:    make(map[string]*DoltTable),
 	}
 }
 
@@ -91,12 +113,16 @@ func (db *Database) GetTableInsensitive(ctx context.Context, tblName string) (sq
 		return nil, false, nil
 	}
 
+	if table, ok := db.tables[exactName]; ok {
+		return table, true, nil
+	}
+
 	tbl, ok, err := db.root.GetTable(ctx, exactName)
 
 	if err != nil {
 		return nil, false, err
 	} else if !ok {
-		panic("Name '" + exactName + "'had already been verified... This is a bug")
+		panic("Name '" + exactName + "' had already been verified... This is a bug")
 	}
 
 	sch, err := tbl.GetSchema(ctx)
@@ -105,7 +131,9 @@ func (db *Database) GetTableInsensitive(ctx context.Context, tblName string) (sq
 		return nil, false, err
 	}
 
-	return &DoltTable{name: tblName, table: tbl, sch: sch, db: db}, true, nil
+	table := &DoltTable{name: exactName, table: tbl, sch: sch, db: db}
+	db.tables[exactName] = table
+	return table, true, nil
 }
 
 func (db *Database) GetTableNames(ctx context.Context) ([]string, error) {
@@ -115,6 +143,13 @@ func (db *Database) GetTableNames(ctx context.Context) ([]string, error) {
 // Root returns the root value for the database.
 func (db *Database) Root() *doltdb.RootValue {
 	return db.root
+}
+
+// Set a new root value for the database. Can be used if the dolt working
+// set value changes outside of the basic SQL execution engine.
+func (db *Database) SetRoot(newRoot *doltdb.RootValue) {
+	// TODO: races
+	db.root = newRoot
 }
 
 // DropTable drops the table with the name given
@@ -133,8 +168,9 @@ func (db *Database) DropTable(ctx *sql.Context, tableName string) error {
 		return err
 	}
 
-	// TODO: races
-	db.root = newRoot
+	delete(db.tables, tableName)
+
+	db.SetRoot(newRoot)
 
 	return nil
 }
@@ -177,8 +213,18 @@ func (db *Database) CreateTable(ctx *sql.Context, tableName string, schema sql.S
 		return err
 	}
 
-	// TODO: races
-	db.root = newRoot
+	db.SetRoot(newRoot)
 
+	return nil
+}
+
+// Flushes the current batch of outstanding changes and returns any errors.
+func (db *Database) Flush(ctx context.Context) error {
+	for name, table := range db.tables {
+		if err := table.flushBatchedEdits(ctx); err != nil {
+			return err
+		}
+		delete(db.tables, name)
+	}
 	return nil
 }
