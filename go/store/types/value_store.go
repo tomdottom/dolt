@@ -174,7 +174,8 @@ func (lvs *ValueStore) ReadValue(ctx context.Context, h hash.Hash) (Value, error
 
 	if chunk.IsEmpty() {
 		var err error
-		verbose.Logger(ctx).Sugar().Warnf("...ReadValue Get(%v)", h)
+		//verbose.Logger(ctx).Sugar().Warnf("...ReadValue Get(%v)", h)
+		verbose.Logger(ctx).Sugar().Warnf("...ReadValue Get(1)")
 		time.Sleep(artificialIODelay)
 		chunk, err = lvs.cs.Get(ctx, h)
 
@@ -261,7 +262,8 @@ func (lvs *ValueStore) ReadManyValues(ctx context.Context, hashes hash.HashSlice
 		ae := atomicerr.New()
 		go func() {
 			defer close(foundChunks)
-			verbose.Logger(ctx).Sugar().Warnf("...ReadManyValues GetMany(%v)", remaining)
+			//verbose.Logger(ctx).Sugar().Warnf("...ReadManyValues GetMany(%v)", remaining)
+			verbose.Logger(ctx).Sugar().Warnf("...ReadManyValues GetMany(%d)", len(remaining))
 			time.Sleep(artificialIODelay)
 			err := lvs.cs.GetMany(ctx, remaining, foundChunks)
 			ae.SetIfError(err)
