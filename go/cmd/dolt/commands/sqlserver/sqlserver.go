@@ -123,7 +123,10 @@ func SqlServerImpl(ctx context.Context, commandStr string, args []string, dEnv *
 	if logLevel, ok := apr.GetValue(logLevelFlag); ok {
 		serverConfig.LogLevel = LogLevel(logLevel)
 	}
-	if startError, closeError := Serve(ctx, serverConfig, root, serverController); startError != nil || closeError != nil {
+
+	cli.PrintErrf("Starting server on port %d.", serverConfig.Port)
+
+	if startError, closeError := Serve(ctx, serverConfig, root, serverController, dEnv.DoltDB, dEnv.RepoState); startError != nil || closeError != nil {
 		if startError != nil {
 			cli.PrintErrln(startError)
 		}
