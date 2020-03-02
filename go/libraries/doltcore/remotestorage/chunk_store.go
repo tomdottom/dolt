@@ -30,6 +30,7 @@ import (
 	"time"
 
 	"github.com/cenkalti/backoff"
+	"go.uber.org/zap"
 
 	eventsapi "github.com/liquidata-inc/dolt/go/gen/proto/dolt/services/eventsapi/v1alpha1"
 	remotesapi "github.com/liquidata-inc/dolt/go/gen/proto/dolt/services/remotesapi/v1alpha1"
@@ -40,6 +41,7 @@ import (
 	"github.com/liquidata-inc/dolt/go/store/hash"
 	"github.com/liquidata-inc/dolt/go/store/nbs"
 	"github.com/liquidata-inc/dolt/go/store/types"
+	"github.com/liquidata-inc/dolt/go/store/util/verbose"
 )
 
 var ErrUploadFailed = errors.New("upload failed")
@@ -846,6 +848,7 @@ func rangeDownloadWithRetries(ctx context.Context, fetcher HTTPFetcher, offset, 
 		req.Header.Set("Range", rangeVal)
 
 		var resp *http.Response
+		verbose.Logger(ctx).Sugar().Info("Fetching range download", zap.String("URL", req.URL.String()), zap.String("Range", rangeVal))
 		resp, err = fetcher.Do(req.WithContext(ctx))
 
 		if err == nil {
@@ -857,11 +860,14 @@ func rangeDownloadWithRetries(ctx context.Context, fetcher HTTPFetcher, offset, 
 		respErr := processHttpResp(resp, err)
 
 		if respErr != nil {
+		        verbose.Logger(ctx).Sugar().Info("Range download returned error", zap.Error(respErr))
 			return respErr
 		}
 
 		// read the results
+	        verbose.Logger(ctx).Sugar().Info("Reading range download results")
 		comprData, err := iohelp.ReadWithMinThroughput(resp.Body, int64(currLength), downThroughputCheck)
+	        verbose.Logger(ctx).Sugar().Info("Finished reading range download results", zap.Int("len", len(comprData)), zap.Error(err))
 
 		dataRead := len(comprData)
 		if dataRead > 0 {
