@@ -848,7 +848,7 @@ func rangeDownloadWithRetries(ctx context.Context, fetcher HTTPFetcher, offset, 
 		req.Header.Set("Range", rangeVal)
 
 		var resp *http.Response
-		verbose.Logger(ctx).Sugar().Info("Fetching range download", zap.String("URL", req.URL.String()), zap.String("Range", rangeVal))
+		verbose.Logger(ctx).Info("Fetching range download", zap.String("URL", req.URL.String()), zap.String("Range", rangeVal))
 		resp, err = fetcher.Do(req.WithContext(ctx))
 
 		if err == nil {
@@ -860,14 +860,14 @@ func rangeDownloadWithRetries(ctx context.Context, fetcher HTTPFetcher, offset, 
 		respErr := processHttpResp(resp, err)
 
 		if respErr != nil {
-		        verbose.Logger(ctx).Sugar().Info("Range download returned error", zap.Error(respErr))
+		        verbose.Logger(ctx).Info("Range download returned error", zap.Error(respErr))
 			return respErr
 		}
 
 		// read the results
-	        verbose.Logger(ctx).Sugar().Info("Reading range download results")
+	        verbose.Logger(ctx).Info("Reading range download results")
 		comprData, err := iohelp.ReadWithMinThroughput(resp.Body, int64(currLength), downThroughputCheck)
-	        verbose.Logger(ctx).Sugar().Info("Finished reading range download results", zap.Int("len", len(comprData)), zap.Error(err))
+	        verbose.Logger(ctx).Info("Finished reading range download results", zap.Int("len", len(comprData)), zap.Error(err))
 
 		dataRead := len(comprData)
 		if dataRead > 0 {
