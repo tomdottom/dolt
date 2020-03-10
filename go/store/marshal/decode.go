@@ -278,7 +278,6 @@ func uintDecoder(ctx context.Context, nbf *types.NomsBinFormat, v types.Value, r
 		rv.SetUint(uint64(n))
 		return nil
 	}
-
 	// code below is kept for backward compatibility
 	if n, ok := v.(types.Float); ok {
 		u := uint64(n)
