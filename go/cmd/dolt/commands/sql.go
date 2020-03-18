@@ -322,6 +322,8 @@ func runBatchMode(ctx context.Context, se *sqlEngine, input io.Reader) error {
 	scanner.Buffer(buf, maxCapacity)
 	scanner.Split(scanStatements)
 
+	updateBatchInsertOutput()
+
 	var query string
 	for scanner.Scan() {
 		query += scanner.Text()
