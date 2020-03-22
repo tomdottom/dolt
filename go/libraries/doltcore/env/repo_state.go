@@ -51,7 +51,11 @@ type RepoState struct {
 }
 
 func LoadRepoState(fs filesys.ReadWriteFS) (*RepoState, error) {
-	path := getRepoStateFile()
+	rsFile := getRepoStateFile()
+	return loadRepoStateFromFile(fs, rsFile)
+}
+
+func loadRepoStateFromFile(fs filesys.ReadWriteFS, path string) (*RepoState, error) {
 	data, err := fs.ReadFile(path)
 
 	if err != nil {
@@ -66,6 +70,11 @@ func LoadRepoState(fs filesys.ReadWriteFS) (*RepoState, error) {
 	}
 
 	return &repoState, nil
+}
+
+func LoadRepoStateForPath(fs filesys.ReadWriteFS, repoPath string) (*RepoState, error) {
+	rsFile := getRepoStateFileForRepoPath(repoPath)
+	return loadRepoStateFromFile(fs, rsFile)
 }
 
 func CloneRepoState(fs filesys.ReadWriteFS, r Remote) (*RepoState, error) {

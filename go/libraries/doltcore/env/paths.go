@@ -80,6 +80,10 @@ func getRepoStateFile() string {
 	return filepath.Join(dbfactory.DoltDir, repoStateFile)
 }
 
+func getRepoStateFileForRepoPath(repoPath string) string {
+	return filepath.Join(repoPath, dbfactory.DoltDir, repoStateFile)
+}
+
 func getHomeDir(hdp HomeDirProvider) (string, error) {
 	homeDir, err := hdp()
 	if err != nil {

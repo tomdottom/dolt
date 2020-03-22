@@ -241,7 +241,7 @@ func (cmd SqlCmd) Exec(ctx context.Context, commandStr string, args []string, dE
 }
 
 func execShell(ctx context.Context, dEnv *env.DoltEnv, root *doltdb.RootValue, format resultFormat) (*doltdb.RootValue, errhand.VerboseError) {
-	se, err := newSqlEngine(ctx, dEnv, dsqle.NewDatabase("dolt", root, dEnv.DoltDB, dEnv.RepoState), format)
+	se, err := newSqlEngine(ctx, format, collectDatabases(root, dEnv)...)
 	if err != nil {
 		return nil, errhand.VerboseErrorFromError(err)
 	}
@@ -254,8 +254,35 @@ func execShell(ctx context.Context, dEnv *env.DoltEnv, root *doltdb.RootValue, f
 	return se.sdb.Root(), nil
 }
 
+func collectDatabases(root *doltdb.RootValue, dEnv *env.DoltEnv) []*dsqle.Database {
+	dbs := make([]*dsqle.Database, 0)
+	dbs = append(dbs, dsqle.NewDatabase(dEnv.GetRepoName(), root, dEnv.DoltDB, dEnv.RepoState))
+	if doltPath, ok := os.LookupEnv("DOLT_PATH"); ok {
+		elems := strings.Split(doltPath, string(os.PathListSeparator))
+		for _, elem := range elems {
+			repoName := filepath.Base(elem)
+			ddb, err := doltdb.LoadDoltDB(context.TODO(), types.Format_Default, doltdb.DoltDBUrlFromRepoPath(elem))
+			if err != nil {
+				panic(err)
+			}
+			rs, err := env.LoadRepoStateForPath(dEnv.FS, elem)
+			if err != nil {
+				panic(err)
+			}
+			root, err := ddb.ReadRootValue(context.TODO(), rs.WorkingHash())
+			if err != nil {
+				panic(err)
+			}
+
+			//de := env.Load(context.TODO(), env.GetCurrentUserHomeDir, filesys.LocalFS, filepath.Join(elem, dbfactory.DoltDataDir), "0.15.1")
+			dbs = append(dbs, dsqle.NewDatabase(repoName, root, ddb, rs))
+		}
+	}
+	return dbs
+}
+
 func execBatch(ctx context.Context, dEnv *env.DoltEnv, root *doltdb.RootValue, batchInput io.Reader, format resultFormat) (*doltdb.RootValue, errhand.VerboseError) {
-	se, err := newSqlEngine(ctx, dEnv, dsqle.NewBatchedDatabase("dolt", root, dEnv.DoltDB, dEnv.RepoState), format)
+	se, err := newSqlEngine(ctx, format, dsqle.NewBatchedDatabase("dolt", root, dEnv.DoltDB, dEnv.RepoState))
 	if err != nil {
 		return nil, errhand.VerboseErrorFromError(err)
 	}
@@ -269,7 +296,7 @@ func execBatch(ctx context.Context, dEnv *env.DoltEnv, root *doltdb.RootValue, b
 }
 
 func execQuery(ctx context.Context, dEnv *env.DoltEnv, root *doltdb.RootValue, query string, format resultFormat) (*doltdb.RootValue, errhand.VerboseError) {
-	se, err := newSqlEngine(ctx, dEnv, dsqle.NewDatabase("dolt", root, dEnv.DoltDB, dEnv.RepoState), format)
+	se, err := newSqlEngine(ctx, format, collectDatabases(root, dEnv)...)
 	if err != nil {
 		return nil, errhand.VerboseErrorFromError(err)
 	}
@@ -282,7 +309,7 @@ func execQuery(ctx context.Context, dEnv *env.DoltEnv, root *doltdb.RootValue, q
 
 	if rowIter != nil {
 		defer rowIter.Close()
-		err = se.prettyPrintResults(ctx, se.ddb.ValueReadWriter().Format(), sqlSch, rowIter)
+		err = se.prettyPrintResults(ctx, se.sdb.Root().VRW().Format(), sqlSch, rowIter)
 		if err != nil {
 			return nil, errhand.VerboseErrorFromError(err)
 		}
@@ -574,7 +601,7 @@ func runShell(ctx context.Context, se *sqlEngine, dEnv *env.DoltEnv) error {
 			shell.Println(verr.Verbose())
 		} else if rowIter != nil {
 			defer rowIter.Close()
-			err = se.prettyPrintResults(ctx, se.ddb.ValueReadWriter().Format(), sqlSch, rowIter)
+			err = se.prettyPrintResults(ctx, se.sdb.Root().VRW().Format(), sqlSch, rowIter)
 			if err != nil {
 				shell.Println(color.RedString(err.Error()))
 			}
@@ -834,7 +861,7 @@ func processNonInsertBatchQuery(ctx context.Context, se *sqlEngine, query string
 				cli.Print("\n")
 				displayStrLen = 0
 			}
-			err = se.prettyPrintResults(ctx, se.ddb.ValueReadWriter().Format(), sqlSch, rowIter)
+			err = se.prettyPrintResults(ctx, se.sdb.Root().VRW().Format(), sqlSch, rowIter)
 			if err != nil {
 				return err
 			}
@@ -928,29 +955,39 @@ const (
 
 type sqlEngine struct {
 	sdb          *dsqle.Database
-	ddb          *doltdb.DoltDB
 	engine       *sqle.Engine
 	resultFormat resultFormat
 }
 
 // sqlEngine packages up the context necessary to run sql queries against sqle.
-func newSqlEngine(ctx context.Context, dEnv *env.DoltEnv, db *dsqle.Database, format resultFormat) (*sqlEngine, error) {
+func newSqlEngine(ctx context.Context, format resultFormat, dbs ...*dsqle.Database) (*sqlEngine, error) {
 	engine := sqle.NewDefault()
-	engine.AddDatabase(db)
-	engine.AddDatabase(sql.NewInformationSchemaDatabase(engine.Catalog))
 
-	engine.Catalog.RegisterIndexDriver(dsqle.NewDoltIndexDriver(db))
+	for _, db := range dbs {
+		err := addDatabase(ctx, engine, db)
+		if err != nil {
+			return nil, err
+		}
+	}
+
+	engine.AddDatabase(sql.NewInformationSchemaDatabase(engine.Catalog))
 	err := engine.Init()
 	if err != nil {
 		return nil, err
 	}
 
-	err = dsqle.RegisterSchemaFragments(sql.NewContext(ctx), engine.Catalog, db)
+	return &sqlEngine{dbs[0], engine, format}, nil
+}
+
+func addDatabase(ctx context.Context, engine *sqle.Engine, db *dsqle.Database) error {
+	engine.AddDatabase(db)
+	engine.Catalog.RegisterIndexDriver(dsqle.NewDoltIndexDriver(db))
+	err := dsqle.RegisterSchemaFragments(sql.NewContext(ctx), engine.Catalog, db)
 	if err != nil {
-		return nil, err
+		return err
 	}
 
-	return &sqlEngine{db, dEnv.DoltDB, engine, format}, nil
+	return nil
 }
 
 // Execute a SQL statement and return values for printing.

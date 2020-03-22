@@ -1036,3 +1036,14 @@ func (dEnv *DoltEnv) GetDocsWithNewerTextFromRoot(ctx context.Context, root *dol
 	}
 	return docs, nil
 }
+
+// GetRepoName returns the name of this env, based on the name of the dir containing the .dolt dir, or "dolt" if it
+// cannot be determined.
+func (dEnv *DoltEnv) GetRepoName() string {
+	abs, err := filepath.Abs(dEnv.GetDoltDir())
+	if err == nil {
+		return filepath.Base(filepath.Dir(abs))
+	}
+
+	return "dolt"
+}

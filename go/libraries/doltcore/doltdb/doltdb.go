@@ -68,6 +68,10 @@ func DoltDBFromCS(cs chunks.ChunkStore) *DoltDB {
 	return &DoltDB{db}
 }
 
+func DoltDBUrlFromRepoPath(repoPath string) string {
+	return fmt.Sprintf("file://%s/%s", repoPath, dbfactory.DoltDataDir)
+}
+
 // LoadDoltDB will acquire a reference to the underlying noms db.  If the Location is InMemDoltDB then a reference
 // to a newly created in memory database will be used. If the location is LocalDirDoltDB, the directory must exist or
 // this returns nil.
