@@ -309,9 +309,11 @@ func execQuery(ctx context.Context, dEnv *env.DoltEnv, root *doltdb.RootValue, q
 
 	if rowIter != nil {
 		defer rowIter.Close()
-		err = se.prettyPrintResults(ctx, se.sdb.Root().VRW().Format(), sqlSch, rowIter)
-		if err != nil {
-			return nil, errhand.VerboseErrorFromError(err)
+		if len(sqlSch) > 0 {
+			err = se.prettyPrintResults(ctx, se.sdb.Root().VRW().Format(), sqlSch, rowIter)
+			if err != nil {
+				return nil, errhand.VerboseErrorFromError(err)
+			}
 		}
 	}
 
@@ -598,12 +600,14 @@ func runShell(ctx context.Context, se *sqlEngine, dEnv *env.DoltEnv) error {
 
 		if sqlSch, rowIter, err := processQuery(ctx, query, se); err != nil {
 			verr := formatQueryError(query, err)
-			shell.Println(verr.Verbose())
+			shell.Println(color.RedString(verr.Verbose()))
 		} else if rowIter != nil {
 			defer rowIter.Close()
-			err = se.prettyPrintResults(ctx, se.sdb.Root().VRW().Format(), sqlSch, rowIter)
-			if err != nil {
-				shell.Println(color.RedString(err.Error()))
+			if len(sqlSch) > 0 {
+				err = se.prettyPrintResults(ctx, se.sdb.Root().VRW().Format(), sqlSch, rowIter)
+				if err != nil {
+					shell.Println(color.RedString(err.Error()))
+				}
 			}
 		}
 
@@ -746,7 +750,7 @@ func processQuery(ctx context.Context, query string, se *sqlEngine) (sql.Schema,
 	}
 
 	switch s := sqlStatement.(type) {
-	case *sqlparser.Select, *sqlparser.Insert, *sqlparser.Update, *sqlparser.OtherRead, *sqlparser.Show, *sqlparser.Explain, *sqlparser.Union:
+	case *sqlparser.Select, *sqlparser.Insert, *sqlparser.Update, *sqlparser.OtherRead, *sqlparser.Show, *sqlparser.Explain, *sqlparser.Union, *sqlparser.Use:
 		return se.query(ctx, query)
 	case *sqlparser.Delete:
 		ok := se.checkThenDeleteAllRows(ctx, s)
