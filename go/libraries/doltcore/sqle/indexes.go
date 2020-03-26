@@ -24,7 +24,6 @@ import (
 
 	"github.com/liquidata-inc/dolt/go/libraries/doltcore/row"
 	"github.com/liquidata-inc/dolt/go/libraries/doltcore/schema"
-	"github.com/liquidata-inc/dolt/go/store/types"
 )
 
 // IndexDriver implementation. Not ready for prime time.
@@ -101,7 +100,11 @@ func keyColsToTuple(sch schema.Schema, key []interface{}) (row.TaggedValues, err
 	var i int
 	taggedVals := make(row.TaggedValues)
 	err := sch.GetPKCols().Iter(func(tag uint64, col schema.Column) (stop bool, err error) {
-		taggedVals[tag] = keyColToValue(key[i], col)
+		val, err := col.TypeInfo.ConvertValueToNomsValue(key[i])
+		if err != nil {
+			return true, err
+		}
+		taggedVals[tag] = val
 		i++
 		return false, nil
 	})
@@ -111,62 +114,6 @@ func keyColsToTuple(sch schema.Schema, key []interface{}) (row.TaggedValues, err
 	}
 
 	return taggedVals, nil
-}
-
-func keyColToValue(v interface{}, column schema.Column) types.Value {
-	// TODO: type conversion
-	switch column.Kind {
-	case types.BoolKind:
-		return types.Bool(v.(bool))
-	case types.IntKind:
-		switch i := v.(type) {
-		case int:
-			return types.Int(i)
-		case int8:
-			return types.Int(i)
-		case int16:
-			return types.Int(i)
-		case int32:
-			return types.Int(i)
-		case int64:
-			return types.Int(i)
-		default:
-			panic(fmt.Sprintf("unhandled type %T", i))
-		}
-	case types.FloatKind:
-		return types.Float(v.(float64))
-	case types.UintKind:
-		switch i := v.(type) {
-		case int:
-			return types.Uint(i)
-		case int8:
-			return types.Uint(i)
-		case int16:
-			return types.Uint(i)
-		case int32:
-			return types.Uint(i)
-		case int64:
-			return types.Uint(i)
-		case uint:
-			return types.Uint(i)
-		case uint8:
-			return types.Uint(i)
-		case uint16:
-			return types.Uint(i)
-		case uint32:
-			return types.Uint(i)
-		case uint64:
-			return types.Uint(i)
-		default:
-			panic(fmt.Sprintf("unhandled type %T", i))
-		}
-	case types.UUIDKind:
-		panic("Implement me")
-	case types.StringKind:
-		return types.String(v.(string))
-	default:
-		panic(fmt.Sprintf("unhandled type %T", v))
-	}
 }
 
 func (*doltIndex) Has(partition sql.Partition, key ...interface{}) (bool, error) {
@@ -195,6 +142,31 @@ func (di *doltIndex) Expressions() []string {
 	}
 
 	return strs
+}
+
+//TODO: this may not be needed depending on how index resolution is handled
+func (di *doltIndex) AllExpressions() [][]string {
+	allExprs := make([][]string, di.sch.GetPKCols().Size())
+	for i := 1; i <= di.sch.GetPKCols().Size(); i++ {
+		allExprs[i-1] = make([]string, i)
+	}
+	i := 0
+	err := di.sch.GetPKCols().Iter(func(tag uint64, col schema.Column) (stop bool, err error) {
+		for j := range allExprs {
+			if j >= i {
+				allExprs[j][i] = di.tableName + "." + col.Name
+			}
+		}
+		i++
+		return false, nil
+	})
+
+	// TODO: fix panics
+	if err != nil {
+		panic(err)
+	}
+
+	return allExprs
 }
 
 // Returns the expression strings needed for this index to work. This needs to match the implementation in the sql

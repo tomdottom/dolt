@@ -18,6 +18,8 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"github.com/liquidata-inc/dolt/go/libraries/doltcore/row"
+	"github.com/liquidata-inc/dolt/go/libraries/doltcore/schema/encoding"
 	"io"
 
 	"github.com/src-d/go-mysql-server/sql"
@@ -39,6 +41,7 @@ type DoltTable struct {
 }
 
 var _ sql.Table = (*DoltTable)(nil)
+var _ sql.IndexAlterableTable = (*DoltTable)(nil)
 
 // Implements sql.IndexableTable
 func (t *DoltTable) WithIndexLookup(lookup sql.IndexLookup) sql.Table {
@@ -104,6 +107,203 @@ func (t *DoltTable) PartitionRows(ctx *sql.Context, _ sql.Partition) (sql.RowIte
 	return newRowIterator(t, ctx)
 }
 
+func (t *DoltTable) AddIndex(ctx *sql.Context, indexName string, using sql.IndexUsing, constraint sql.IndexConstraint, columns []sql.IndexColumn, comment string) error {
+	if !doltdb.IsValidTableName(indexName) {
+		return fmt.Errorf("invalid index name `%s` as they must match the regular expression %s", indexName, doltdb.TableNameRegexStr)
+	}
+
+	var cols []schema.Column
+	var realColNames []string
+	var pkNames []string
+	currentTag := uint64(0)
+	foundPKCols := make(map[string]struct{})
+	allTableCols := t.sch.GetAllCols()
+	for _, indexCol := range columns {
+		tableCol, ok := allTableCols.GetByName(indexCol.Name)
+		if !ok {
+			tableCol, ok = allTableCols.GetByNameCaseInsensitive(indexCol.Name)
+			if !ok {
+				return fmt.Errorf("column `%s` does not exist for the table", indexCol.Name)
+			}
+		}
+		if tableCol.IsPartOfPK {
+			foundPKCols[tableCol.Name] = struct{}{}
+		}
+		realColNames = append(realColNames, tableCol.Name)
+		cols = append(cols, schema.Column{
+			Name:        tableCol.Name,
+			Tag:         currentTag,
+			Kind:        tableCol.TypeInfo.NomsKind(),
+			IsPartOfPK:  true,
+			TypeInfo:    tableCol.TypeInfo,
+			Constraints: nil,
+		})
+		currentTag++
+	}
+	_ = t.sch.GetPKCols().Iter(func(tag uint64, tableCol schema.Column) (bool, error) {
+		pkNames = append(pkNames, tableCol.Name)
+		if _, ok := foundPKCols[tableCol.Name]; !ok {
+			cols = append(cols, schema.Column{
+				Name:        tableCol.Name,
+				Tag:         currentTag,
+				Kind:        tableCol.TypeInfo.NomsKind(),
+				IsPartOfPK:  true,
+				TypeInfo:    tableCol.TypeInfo,
+				Constraints: nil,
+			})
+			currentTag++
+		}
+		return false, nil
+	})
+
+	colColl, err := schema.NewColCollection(cols...)
+	if err != nil {
+		return err
+	}
+	indexSch := schema.SchemaFromCols(colColl)
+	index, err := t.sch.Indexes().AddIndexCol(indexName, realColNames, pkNames)
+	if err != nil {
+		return err
+	}
+
+	newSchemaVal, err := encoding.MarshalAsNomsValue(ctx, t.table.ValueReadWriter(), t.sch)
+	if err != nil {
+		return err
+	}
+	rowData, err := t.table.GetRowData(ctx)
+	if err != nil {
+		return err
+	}
+	newTable, err := doltdb.NewTable(ctx, t.table.ValueReadWriter(), newSchemaVal, rowData)
+	if err != nil {
+		return err
+	}
+	newRoot, err := t.db.root.PutTable(ctx, t.name, newTable)
+	if err != nil {
+		return err
+	}
+
+	indexData, err := types.NewMap(ctx, newRoot.VRW())
+	if err != nil {
+		return err
+	}
+	indexDataEditor := indexData.Edit()
+	err = rowData.IterAll(ctx, func(key, value types.Value) error {
+		dRow, err := row.FromNoms(t.sch, key.(types.Tuple), value.(types.Tuple))
+		if err != nil {
+			return err
+		}
+		indexRow, err := dRow.ReduceToIndex(index)
+		if err != nil {
+			return err
+		}
+		indexKey, err := indexRow.NomsMapKey(indexSch).Value(ctx)
+		if err != nil {
+			return err
+		}
+		indexDataEditor = indexDataEditor.Set(indexKey, dRow.NomsMapValue(indexSch))
+		return nil
+	})
+	if err != nil {
+		return err
+	}
+	indexData, err = indexDataEditor.Map(ctx)
+	if err != nil {
+		return err
+	}
+
+	indexSchVal, err := encoding.MarshalAsNomsValue(ctx, newRoot.VRW(), indexSch)
+	if err != nil {
+		return err
+	}
+	indexTbl, err := doltdb.NewTable(ctx, newRoot.VRW(), indexSchVal, indexData)
+	if err != nil {
+		return err
+	}
+	newRoot, err = newRoot.PutTable(ctx, index.FullName(t.name), indexTbl)
+	if err != nil {
+		return err
+	}
+
+	t.db.SetRoot(newRoot)
+	return nil
+}
+
+func (t *DoltTable) DropIndex(ctx *sql.Context, indexName string) error {
+	index, err := t.sch.Indexes().DropIndex(indexName)
+	if err != nil {
+		return err
+	}
+	newRoot, err := t.saveSchemaChanges(ctx, t.db.root)
+	if err != nil {
+		return err
+	}
+	newRoot, err = newRoot.RemoveTables(ctx, index.FullName(t.name))
+	if err != nil {
+		return err
+	}
+	t.db.SetRoot(newRoot)
+	return nil
+}
+
+func (t *DoltTable) RenameIndex(ctx *sql.Context, fromIndexName string, toIndexName string) error {
+	index := t.sch.Indexes().Get(fromIndexName)
+	if index == nil {
+		return fmt.Errorf("`%s` does not exist as an index for this table", fromIndexName)
+	}
+	fromFullName := index.FullName(t.name)
+
+	index, err := t.sch.Indexes().RenameIndex(fromIndexName, toIndexName)
+	if err != nil {
+		return err
+	}
+	newRoot, err := t.saveSchemaChanges(ctx, t.db.root)
+	if err != nil {
+		return err
+	}
+
+	idxTable, ok, err := newRoot.GetTable(ctx, fromFullName)
+	if err != nil {
+		return err
+	}
+	if !ok {
+		return fmt.Errorf("failed to get index table `%s`", fromFullName)
+	}
+
+	newRoot, err = newRoot.PutTable(ctx, index.FullName(t.name), idxTable)
+	if err != nil {
+		return err
+	}
+	newRoot, err = newRoot.RemoveTables(ctx, fromFullName)
+	if err != nil {
+		return err
+	}
+
+	t.db.SetRoot(newRoot)
+	return nil
+}
+
+func (t *DoltTable) saveSchemaChanges(ctx *sql.Context, root *doltdb.RootValue) (*doltdb.RootValue, error) {
+	newSchemaVal, err := encoding.MarshalAsNomsValue(ctx, t.table.ValueReadWriter(), t.sch)
+	if err != nil {
+		return nil, err
+	}
+	rowData, err := t.table.GetRowData(ctx)
+	if err != nil {
+		return nil, err
+	}
+	newTable, err := doltdb.NewTable(ctx, t.table.ValueReadWriter(), newSchemaVal, rowData)
+	if err != nil {
+		return nil, err
+	}
+	newRoot, err := root.PutTable(ctx, t.name, newTable)
+	if err != nil {
+		return nil, err
+	}
+	t.table = newTable
+	return newRoot, nil
+}
+
 // WritableDoltTable allows updating, deleting, and inserting new rows. It implements sql.UpdatableTable and friends.
 type WritableDoltTable struct {
 	DoltTable
@@ -117,18 +317,18 @@ var _ sql.ReplaceableTable = (*WritableDoltTable)(nil)
 
 // Inserter implements sql.InsertableTable
 func (t *WritableDoltTable) Inserter(ctx *sql.Context) sql.RowInserter {
-	return t.getTableEditor()
+	return t.getTableEditor(ctx)
 }
 
-func (t *WritableDoltTable) getTableEditor() *tableEditor {
+func (t *WritableDoltTable) getTableEditor(ctx *sql.Context) *tableEditor {
 	if t.db.batchMode == batched {
 		if t.ed != nil {
 			return t.ed
 		}
-		t.ed = newTableEditor(t)
+		t.ed = newTableEditor(ctx, t)
 		return t.ed
 	}
-	return newTableEditor(t)
+	return newTableEditor(ctx, t)
 }
 
 func (t *WritableDoltTable) flushBatchedEdits(ctx context.Context) error {
@@ -141,18 +341,18 @@ func (t *WritableDoltTable) flushBatchedEdits(ctx context.Context) error {
 }
 
 // Deleter implements sql.DeletableTable
-func (t *WritableDoltTable) Deleter(*sql.Context) sql.RowDeleter {
-	return t.getTableEditor()
+func (t *WritableDoltTable) Deleter(ctx *sql.Context) sql.RowDeleter {
+	return t.getTableEditor(ctx)
 }
 
 // Replacer implements sql.ReplaceableTable
 func (t *WritableDoltTable) Replacer(ctx *sql.Context) sql.RowReplacer {
-	return t.getTableEditor()
+	return t.getTableEditor(ctx)
 }
 
 // Updater implements sql.UpdatableTable
 func (t *WritableDoltTable) Updater(ctx *sql.Context) sql.RowUpdater {
-	return t.getTableEditor()
+	return t.getTableEditor(ctx)
 }
 
 // doltTablePartitionIter, an object that knows how to return the single partition exactly once.

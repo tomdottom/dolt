@@ -17,6 +17,8 @@ package sqle
 import (
 	"context"
 	"fmt"
+	"github.com/liquidata-inc/dolt/go/libraries/doltcore/row"
+	"github.com/liquidata-inc/dolt/go/libraries/doltcore/schema"
 
 	"github.com/src-d/go-mysql-server/sql"
 
@@ -39,8 +41,14 @@ var ErrDuplicatePrimaryKeyFmt = "duplicate primary key given: (%v)"
 // editor after every SQL statement is incorrect and will return incorrect results. The single reliable exception is an
 // unbroken chain of INSERT statements, where we have taken pains to batch writes to speed things up.
 type tableEditor struct {
+	tableEd *subTableEditor
+	indexEds []*subTableEditor
+}
+
+type subTableEditor struct {
 	t            *WritableDoltTable
 	ed           *types.MapEditor
+	idx          schema.Index
 	insertedKeys map[hash.Hash]types.Value
 	addedKeys    map[hash.Hash]types.Value
 	removedKeys  map[hash.Hash]types.Value
@@ -51,21 +59,64 @@ var _ sql.RowUpdater = (*tableEditor)(nil)
 var _ sql.RowInserter = (*tableEditor)(nil)
 var _ sql.RowDeleter = (*tableEditor)(nil)
 
-func newTableEditor(t *WritableDoltTable) *tableEditor {
-	return &tableEditor{
-		t:            t,
-		insertedKeys: make(map[hash.Hash]types.Value),
-		addedKeys:    make(map[hash.Hash]types.Value),
-		removedKeys:  make(map[hash.Hash]types.Value),
+func newTableEditor(ctx *sql.Context, t *WritableDoltTable) *tableEditor {
+	te := &tableEditor{
+		tableEd:  &subTableEditor{
+			t:            t,
+			insertedKeys: make(map[hash.Hash]types.Value),
+			addedKeys:    make(map[hash.Hash]types.Value),
+			removedKeys:  make(map[hash.Hash]types.Value),
+		},
+		indexEds: make([]*subTableEditor, t.sch.Indexes().Count()),
 	}
+	for i, index := range t.sch.Indexes().AllIndexes() {
+		indexTbl, ok, err := t.db.GetTableInsensitive(ctx, index.FullName(t.name))
+		if err != nil || !ok {
+			// repo is in an invalid state with index metadata for a non-existent index table
+			panic(fmt.Errorf("failed to get index table `%s`", index.FullName(t.name)))
+		}
+		indexTable, ok := indexTbl.(*DoltTable)
+		if !ok {
+			// code logic issue, returned table should always be writable
+			panic(fmt.Errorf("index table `%s` should be writable", index.FullName(t.name)))
+		}
+		te.indexEds[i] = &subTableEditor{
+			t:            &WritableDoltTable{DoltTable: *indexTable},
+			idx:          index,
+			insertedKeys: make(map[hash.Hash]types.Value),
+			addedKeys:    make(map[hash.Hash]types.Value),
+			removedKeys:  make(map[hash.Hash]types.Value),
+		}
+	}
+	return te
 }
 
 func (te *tableEditor) Insert(ctx *sql.Context, sqlRow sql.Row) error {
-	dRow, err := SqlRowToDoltRow(te.t.table.Format(), sqlRow, te.t.sch)
+	dRow, err := SqlRowToDoltRow(te.tableEd.t.table.Format(), sqlRow, te.tableEd.t.sch)
 	if err != nil {
 		return err
 	}
 
+	err = te.tableEd.Insert(ctx, dRow)
+	if err != nil {
+		return err
+	}
+
+	for _, indexEd := range te.indexEds {
+		dIndexRow, err := dRow.ReduceToIndex(indexEd.idx)
+		if err != nil {
+			return err
+		}
+		err = indexEd.Insert(ctx, dIndexRow)
+		if err != nil {
+			return err
+		}
+	}
+
+	return nil
+}
+
+func (te *subTableEditor) Insert(ctx *sql.Context, dRow row.Row) error {
 	key, err := dRow.NomsMapKey(te.t.sch).Value(ctx)
 	if err != nil {
 		return errhand.BuildDError("failed to get row key").AddCause(err).Build()
@@ -100,11 +151,31 @@ func (te *tableEditor) Insert(ctx *sql.Context, sqlRow sql.Row) error {
 }
 
 func (te *tableEditor) Delete(ctx *sql.Context, sqlRow sql.Row) error {
-	dRow, err := SqlRowToDoltRow(te.t.table.Format(), sqlRow, te.t.sch)
+	dRow, err := SqlRowToDoltRow(te.tableEd.t.table.Format(), sqlRow, te.tableEd.t.sch)
 	if err != nil {
 		return err
 	}
 
+	err = te.tableEd.Delete(ctx, dRow)
+	if err != nil {
+		return err
+	}
+
+	for _, indexEd := range te.indexEds {
+		dIndexRow, err := dRow.ReduceToIndex(indexEd.idx)
+		if err != nil {
+			return err
+		}
+		err = indexEd.Delete(ctx, dIndexRow)
+		if err != nil {
+			return err
+		}
+	}
+
+	return nil
+}
+
+func (te *subTableEditor) Delete(ctx *sql.Context, dRow row.Row) error {
 	key, err := dRow.NomsMapKey(te.t.sch).Value(ctx)
 	if err != nil {
 		return errhand.BuildDError("failed to get row key").AddCause(err).Build()
@@ -138,15 +209,39 @@ func (t *DoltTable) newMapEditor(ctx context.Context) (*types.MapEditor, error) 
 }
 
 func (te *tableEditor) Update(ctx *sql.Context, oldRow sql.Row, newRow sql.Row) error {
-	dOldRow, err := SqlRowToDoltRow(te.t.table.Format(), oldRow, te.t.sch)
+	dOldRow, err := SqlRowToDoltRow(te.tableEd.t.table.Format(), oldRow, te.tableEd.t.sch)
 	if err != nil {
 		return err
 	}
-	dNewRow, err := SqlRowToDoltRow(te.t.table.Format(), newRow, te.t.sch)
+	dNewRow, err := SqlRowToDoltRow(te.tableEd.t.table.Format(), newRow, te.tableEd.t.sch)
 	if err != nil {
 		return err
 	}
 
+	err = te.tableEd.Update(ctx, dOldRow, dNewRow)
+	if err != nil {
+		return err
+	}
+
+	for _, indexEd := range te.indexEds {
+		dOldIndexRow, err := dOldRow.ReduceToIndex(indexEd.idx)
+		if err != nil {
+			return err
+		}
+		dNewIndexRow, err := dNewRow.ReduceToIndex(indexEd.idx)
+		if err != nil {
+			return err
+		}
+		err = indexEd.Update(ctx, dOldIndexRow, dNewIndexRow)
+		if err != nil {
+			return err
+		}
+	}
+
+	return nil
+}
+
+func (te *subTableEditor) Update(ctx *sql.Context, dOldRow row.Row, dNewRow row.Row) error {
 	// If the PK is changed then we need to delete the old value and insert the new one
 	dOldKey := dOldRow.NomsMapKey(te.t.sch)
 	dOldKeyVal, err := dOldKey.Value(ctx)
@@ -193,13 +288,27 @@ func (te *tableEditor) Update(ctx *sql.Context, oldRow sql.Row, newRow sql.Row) 
 // Close implements Closer
 func (te *tableEditor) Close(ctx *sql.Context) error {
 	// If we're running in batched mode, don't flush the edits until explicitly told to do so by the parent table.
-	if te.t.db.batchMode == batched {
+	if te.tableEd.t.db.batchMode == batched {
 		return nil
 	}
 	return te.flush(ctx)
 }
 
 func (te *tableEditor) flush(ctx context.Context) error {
+	err := te.tableEd.flush(ctx)
+	if err != nil {
+		return err
+	}
+	for _, indexEd := range te.indexEds {
+		err = indexEd.flush(ctx)
+		if err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (te *subTableEditor) flush(ctx context.Context) error {
 	// For all added keys, check for and report a collision
 	for hash, addedKey := range te.addedKeys {
 		if _, ok := te.removedKeys[hash]; !ok {
