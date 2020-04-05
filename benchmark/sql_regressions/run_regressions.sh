@@ -70,9 +70,11 @@ function run() {
 function check_version_exists() {
     if [[ "$JOB_TYPE" == "nightly" ]]; then
       dolt checkout nightly
+      dolt pull origin
       table_prefix="nightly"
     elif [ "$JOB_TYPE" == "release" ]; then
         dolt checkout releases
+        dolt pull origin
         table_prefix="releases"
       else fail Unknown JOB_TYPE specified;
     fi
@@ -97,6 +99,7 @@ function import_one_nightly() {
 
 function import_nightly() {
     dolt checkout nightly
+    dolt pull origin
     seq 1 $TEST_N_TIMES | while read test_num; do
         import_one_nightly "$test_num"
     done
@@ -177,6 +180,7 @@ function import_one_releases() {
 
 function import_releases() {
     dolt checkout releases
+    dolt pull origin
     seq 1 $TEST_N_TIMES | while read test_num; do
         import_one_releases "$test_num"
     done
