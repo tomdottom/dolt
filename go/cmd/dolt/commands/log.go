@@ -17,6 +17,7 @@ package commands
 import (
 	"context"
 	"fmt"
+	"regexp"
 	"strings"
 
 	"github.com/fatih/color"
@@ -32,7 +33,9 @@ import (
 )
 
 const (
-	numLinesParam = "number"
+	numLinesParam =  "number"
+	logOneLineFlag = "oneline"
+	logDiffSummary = "diff"
 )
 
 var logDocs = cli.CommandDocumentationContent{
@@ -57,6 +60,16 @@ func logToStdOutFunc(cm *doltdb.CommitMeta, parentHashes []hash.Hash, ch hash.Ha
 	printAuthor(cm)
 	printDate(cm)
 	printDesc(cm)
+}
+
+func logOnelineToStdOutFunc(cm *doltdb.CommitMeta, parentHashes []hash.Hash, ch hash.Hash) {
+	ych := color.YellowString(ch.String())
+	formattedDesc := regexp.MustCompile(`\r?\n`).ReplaceAllString(cm.Description, " ")
+	cli.Println(fmt.Sprintf("%s %s", ych, formattedDesc))
+}
+
+func logDiffSummaryToStdOutFunc(cm *doltdb.CommitMeta, parentHashes []hash.Hash, ch hash.Hash) {
+	cli.Println(ch.String())
 }
 
 func printMerge(hashes []hash.Hash) {
@@ -107,15 +120,17 @@ func (cmd LogCmd) CreateMarkdown(fs filesys.Filesys, path, commandStr string) er
 func createLogArgParser() *argparser.ArgParser {
 	ap := argparser.NewArgParser()
 	ap.SupportsInt(numLinesParam, "n", "num_commits", "Limit the number of commits to output")
+	ap.SupportsFlag(logOneLineFlag, "", "Summarize commit log to one line per commit")
+	ap.SupportsFlag(logDiffSummary, "", "Print schema diffs at each commit")
 	return ap
 }
 
 // Exec executes the command
 func (cmd LogCmd) Exec(ctx context.Context, commandStr string, args []string, dEnv *env.DoltEnv) int {
-	return logWithLoggerFunc(ctx, commandStr, args, dEnv, logToStdOutFunc)
+	return logWithLoggerFunc(ctx, commandStr, args, dEnv)
 }
 
-func logWithLoggerFunc(ctx context.Context, commandStr string, args []string, dEnv *env.DoltEnv, loggerFunc commitLoggerFunc) int {
+func logWithLoggerFunc(ctx context.Context, commandStr string, args []string, dEnv *env.DoltEnv) int {
 	ap := createLogArgParser()
 	help, usage := cli.HelpAndUsagePrinters(cli.GetCommandDocumentation(commandStr, logDocs, ap))
 	apr := cli.ParseArgs(ap, args, help)
@@ -129,6 +144,16 @@ func logWithLoggerFunc(ctx context.Context, commandStr string, args []string, dE
 	if err != nil {
 		cli.PrintErr(err)
 		return 1
+	}
+
+	var loggerFunc commitLoggerFunc
+	switch {
+	case apr.Contains(logOneLineFlag):
+		loggerFunc = logOnelineToStdOutFunc
+	case apr.Contains(logDiffSummary):
+		loggerFunc = logDiffSummaryToStdOutFunc
+	default:
+		loggerFunc = logToStdOutFunc
 	}
 
 	numLines := apr.GetIntOrDefault(numLinesParam, -1)
