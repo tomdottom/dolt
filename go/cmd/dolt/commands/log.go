@@ -17,6 +17,7 @@ package commands
 import (
 	"context"
 	"fmt"
+	"github.com/liquidata-inc/dolt/go/libraries/doltcore/schema"
 	"regexp"
 	"strings"
 
@@ -48,9 +49,9 @@ The command takes options to control what is shown and how.`,
 	},
 }
 
-type commitLoggerFunc func(*doltdb.CommitMeta, []hash.Hash, hash.Hash)
+type commitLoggerFunc func(*doltdb.DoltDB, *doltdb.CommitMeta, []hash.Hash, hash.Hash) error
 
-func logToStdOutFunc(cm *doltdb.CommitMeta, parentHashes []hash.Hash, ch hash.Hash) {
+func logToStdOutFunc(_ *doltdb.DoltDB, cm *doltdb.CommitMeta, parentHashes []hash.Hash, ch hash.Hash) error {
 	cli.Println(color.YellowString("commit %s", ch.String()))
 
 	if len(parentHashes) > 1 {
@@ -60,16 +61,48 @@ func logToStdOutFunc(cm *doltdb.CommitMeta, parentHashes []hash.Hash, ch hash.Ha
 	printAuthor(cm)
 	printDate(cm)
 	printDesc(cm)
+	return nil
 }
 
-func logOnelineToStdOutFunc(cm *doltdb.CommitMeta, parentHashes []hash.Hash, ch hash.Hash) {
+func logOnelineToStdOutFunc(_ *doltdb.DoltDB, cm *doltdb.CommitMeta, _ []hash.Hash, ch hash.Hash) error {
 	ych := color.YellowString(ch.String())
 	formattedDesc := regexp.MustCompile(`\r?\n`).ReplaceAllString(cm.Description, " ")
 	cli.Println(fmt.Sprintf("%s %s", ych, formattedDesc))
+	return nil
 }
 
-func logDiffSummaryToStdOutFunc(cm *doltdb.CommitMeta, parentHashes []hash.Hash, ch hash.Hash) {
-	cli.Println(ch.String())
+func logSchemaDiffToStdOutFunc(ddb *doltdb.DoltDB, cm *doltdb.CommitMeta, parentHashes []hash.Hash, ch hash.Hash) error {
+	switch len(parentHashes) {
+	case 0:
+		_ = logOnelineToStdOutFunc(ddb, cm, parentHashes, ch)
+	case 1:
+		twoDot := color.YellowString(fmt.Sprintf("%s..%s", ch.String(), parentHashes[0].String()))
+		formattedDesc := regexp.MustCompile(`\r?\n`).ReplaceAllString(cm.Description, " ")
+		cli.Println(fmt.Sprintf("%s %s", twoDot, formattedDesc))
+		err := logSchemaDiff(ddb, ch, parentHashes[0])
+		if err != nil {
+			return err
+		}
+	case 2:
+		twoDot := color.HiYellowString(fmt.Sprintf("%s..%s", ch.String(), parentHashes[0].String()))
+		formattedDesc := regexp.MustCompile(`\r?\n`).ReplaceAllString(cm.Description, " ")
+		cli.Println(fmt.Sprintf("%s %s", twoDot, formattedDesc))
+		err := logSchemaDiff(ddb, ch, parentHashes[0])
+		if err != nil {
+			return err
+		}
+
+		twoDot = color.HiYellowString(fmt.Sprintf("%s..%s", ch.String(), parentHashes[1].String()))
+		formattedDesc = regexp.MustCompile(`\r?\n`).ReplaceAllString(cm.Description, " ")
+		cli.Println(fmt.Sprintf("%s %s", twoDot, formattedDesc))
+		err = logSchemaDiff(ddb, ch, parentHashes[1])
+		if err != nil {
+			return err
+		}
+	default:
+		cli.PrintErrln("Logging octopus merges is not yet supported")
+	}
+	return nil
 }
 
 func printMerge(hashes []hash.Hash) {
@@ -151,7 +184,7 @@ func logWithLoggerFunc(ctx context.Context, commandStr string, args []string, dE
 	case apr.Contains(logOneLineFlag):
 		loggerFunc = logOnelineToStdOutFunc
 	case apr.Contains(logDiffSummary):
-		loggerFunc = logDiffSummaryToStdOutFunc
+		loggerFunc = logSchemaDiffToStdOutFunc
 	default:
 		loggerFunc = logToStdOutFunc
 	}
@@ -218,8 +251,102 @@ func logCommits(ctx context.Context, dEnv *env.DoltEnv, cs *doltdb.CommitSpec, l
 			cli.PrintErrln("error: failed to get commit hash")
 			return 1
 		}
-		loggerFunc(meta, pHashes, cmHash)
+
+		err = loggerFunc(dEnv.DoltDB, meta, pHashes, cmHash)
+
+		if err != nil {
+			cli.PrintErrln(err.Error())
+			return 1
+		}
 	}
 
 	return 0
+}
+
+func logSchemaDiff(ddb *doltdb.DoltDB, commitHash, parentHash hash.Hash) error {
+	ctx := context.Background()
+
+	cs, err := doltdb.NewCommitSpec(commitHash.String(), "")
+
+	if err != nil {
+		return err
+	}
+
+	cm, err := ddb.Resolve(ctx, cs)
+
+	if err != nil {
+		return err
+	}
+
+	root, err := cm.GetRootValue()
+
+	if err != nil {
+		return err
+	}
+
+	pcs, err := doltdb.NewCommitSpec(parentHash.String(), "")
+
+	if err != nil {
+		return err
+	}
+
+	pcm, err := ddb.Resolve(ctx, pcs)
+
+	if err != nil {
+		return err
+	}
+
+	parentRoot, err := pcm.GetRootValue()
+
+	if err != nil {
+		return err
+	}
+
+	allTableNames, err := doltdb.UnionTableNames(ctx, root, parentRoot)
+
+	if err != nil {
+		return err
+	}
+
+	var sch schema.Schema
+	var parentSch schema.Schema
+	for _, tn := range allTableNames {
+		sch = schema.EmptySchema
+		parentSch = schema.EmptySchema
+
+		t, found, err := root.GetTable(ctx, tn)
+
+		if err != nil {
+			return err
+		}
+
+		if found {
+			sch, err = t.GetSchema(ctx)
+
+			if err != nil {
+				return err
+			}
+		}
+
+		pt, found, err := parentRoot.GetTable(ctx, tn)
+
+		if err != nil {
+			return err
+		}
+
+		if found {
+			parentSch, err = pt.GetSchema(ctx)
+
+			if err != nil {
+				return err
+			}
+		}
+
+		verr := diffSchemas(tn, parentSch, sch, &diffArgs{diffOutput: TabularDiffOutput, diffParts: SchemaOnlyDiff})
+
+		if verr != nil {
+			return verr
+		}
+	}
+	return nil
 }
